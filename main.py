@@ -1,43 +1,68 @@
-import json
-import re
-import time
-from pathlib import Path
+# ==============================================================================
+# [프로그램 전체 소개] Mini NPU Simulator (그림 판별 숫자 계산기)
+#
+# - 사람이 눈으로 '+'(십자가)와 'X'를 구별하듯, 눈이 없는 컴퓨터가
+#   0(빈칸)과 1(색칠된 칸)로 이루어진 '숫자 바둑판' 점수를 계산해 모양을 맞히는 프로그램입니다.
+# - 핵심 원리(MAC 연산): 두 바둑판을 겹쳐서 같은 자리에 있는 숫자끼리 곱한 뒤 모두 더합니다.
+# ==============================================================================
 
-# 부동소수점 오차 보정을 위한 동점 판정 허용오차 (epsilon)
+import json     # 문제 파일(data.json)을 읽어오기 위한 파이썬 기본 도구
+import re       # 'size_5_1' 같은 글자에서 숫자(5)만 쏙 뽑아내기 위한 기본 도구
+import time     # 계산하는 데 몇 밀리초(ms)가 걸리는지 초시계처럼 재는 기본 도구
+from pathlib import Path  # 파일이 폴더 안에 실제로 존재하는지 확인하는 기본 도구
+
+# [기본 설정값]
+# 컴퓨터가 소수점 계산을 할 때 생기는 아주 미세한 오차(0.000000001 미만)는
+# 사실상 점수가 똑같은 '무승부'로 처리하기 위한 기준값입니다.
 EPSILON = 1e-9
+
+# 계산 속도를 정확히 재기 위해 같은 계산을 몇 번 반복해서 평균을 낼지 정하는 횟수입니다.
 REPEAT_COUNT = 10
 
 
 class PatternMatrix:
-    """n×n 크기의 2차원 패턴 및 필터 데이터를 저장하고 조작하는 클래스"""
+    """
+    [숫자 바둑판 보관함]
+    가로 N칸, 세로 N칸 크기의 2차원 숫자 바둑판(정답지 필터 또는 문제 패턴)을
+    저장하고, 특정 칸의 숫자를 읽거나 고치는 역할을 담당합니다.
+    """
 
     def __init__(self, size: int, grid=None):
+        # 바둑판 크기가 0 이하이면 잘못된 크기이므로 안내 문구를 띄웁니다.
         if size <= 0:
             raise ValueError("배열 크기는 1 이상이어야 합니다.")
         self.size = size
+
+        # 미리 전달받은 숫자 표가 없으면, 모든 칸이 0.0으로 채워진 빈 바둑판을 만듭니다.
         if grid is None:
             self.grid = [[0.0 for _ in range(size)] for _ in range(size)]
         else:
+            # 전달받은 표의 가로·세로 줄 수가 약속된 크기(size×size)와 다르면 불량 데이터로 걸러냅니다.
             if len(grid) != size or any(len(row) != size for row in grid):
                 raise ValueError(f"크기 불일치: {size}×{size} 정사각 배열이 아닙니다.")
+            # 모든 칸의 숫자를 소수점 계산이 가능한 숫자(float) 형태로 깔끔하게 저장합니다.
             self.grid = [[float(val) for val in row] for row in grid]
 
     def get_value(self, row: int, col: int) -> float:
-        """특정 위치(row, col)의 값을 읽어옵니다."""
+        """바둑판의 특정 위치(row번째 줄, col번째 칸)에 적힌 숫자를 읽어옵니다."""
         self._check_bounds(row, col)
         return self.grid[row][col]
 
     def set_value(self, row: int, col: int, value: float) -> None:
-        """특정 위치(row, col)에 값을 저장합니다."""
+        """바둑판의 특정 위치(row번째 줄, col번째 칸)에 새로운 숫자를 적어 넣습니다."""
         self._check_bounds(row, col)
         self.grid[row][col] = float(value)
 
     def _check_bounds(self, row: int, col: int) -> None:
+        """바둑판 범위를 벗어난 엉뚱한 칸을 찾으려고 할 때 미리 막아주는 안전장치입니다."""
         if not (0 <= row < self.size and 0 <= col < self.size):
             raise IndexError(f"인덱스 범위 초과: ({row}, {col})는 {self.size}×{self.size} 범위를 벗어났습니다.")
 
     def to_1d(self) -> list:
-        """[보너스] 2차원 배열을 길이 N²의 1차원 배열로 변환합니다."""
+        """
+        [보너스 기능] 2차원 네모 바둑판을 한 줄짜리 긴 숫자 목록(길이 N²)으로 쭉 펴줍니다.
+        컴퓨터가 칸을 하나씩 찾아가는 과정을 단순하게 만들어 속도를 높일 때 사용합니다.
+        """
         flat = []
         for row in self.grid:
             flat.extend(row)
@@ -45,10 +70,14 @@ class PatternMatrix:
 
 
 def normalize_label(raw_label: str) -> str:
-    """제각각인 라벨 표기('+', 'cross', 'x' 등)를 표준 라벨('Cross', 'X')로 통일합니다."""
+    """
+    [이름표 통일 기능]
+    문제 파일(data.json) 안에 십자가가 '+' 또는 'cross'처럼 제각각 적혀 있어도
+    프로그램 안에서는 항상 표준 이름인 'Cross'와 'X'로 통일해 줍니다.
+    """
     if not isinstance(raw_label, str):
         raise ValueError(f"유효하지 않은 라벨 형식: {raw_label}")
-    cleaned = raw_label.strip().lower()
+    cleaned = raw_label.strip().lower()  # 앞뒤 공백을 지우고 소문자로 바꿉니다.
     if cleaned in ("+", "cross"):
         return "Cross"
     if cleaned == "x":
@@ -57,7 +86,12 @@ def normalize_label(raw_label: str) -> str:
 
 
 def compute_mac(pattern: PatternMatrix, filter_matrix: PatternMatrix) -> float:
-    """외부 라이브러리 없이 이중 반복문으로 위치별 곱셈 후 누적 합(MAC)을 계산합니다."""
+    """
+    [핵심 계산 기능: MAC 연산]
+    문제 바둑판(pattern)과 정답지 바둑판(filter_matrix)을 똑같이 겹쳐 놓고,
+    같은 칸에 있는 숫자끼리 곱한 뒤 그 결과를 전부 더해서 '닮은 점수'를 계산합니다.
+    (외부 계산 도구 없이 파이썬 기본 반복문만으로 직접 계산합니다.)
+    """
     if pattern.size != filter_matrix.size:
         raise ValueError(
             f"패턴 크기({pattern.size}×{pattern.size})와 필터 크기({filter_matrix.size}×{filter_matrix.size})가 일치하지 않습니다."
@@ -65,7 +99,9 @@ def compute_mac(pattern: PatternMatrix, filter_matrix: PatternMatrix) -> float:
     n = pattern.size
     p_grid = pattern.grid
     f_grid = filter_matrix.grid
-    total = 0.0
+    total = 0.0  # 점수를 누적해서 더해 나갈 바구니
+
+    # 위에서 아래로 한 줄씩(r), 왼쪽에서 오른쪽으로 한 칸씩(c) 이동하며 곱하고 더합니다.
     for r in range(n):
         for c in range(n):
             total += p_grid[r][c] * f_grid[r][c]
@@ -73,7 +109,10 @@ def compute_mac(pattern: PatternMatrix, filter_matrix: PatternMatrix) -> float:
 
 
 def compute_mac_1d(pattern_1d: list, filter_1d: list) -> float:
-    """[보너스] 1차원 배열로 변환된 데이터의 MAC 연산을 수행합니다."""
+    """
+    [보너스 기능: 1줄 방식 MAC 연산]
+    한 줄로 길게 편 두 숫자 목록을 처음부터 끝까지 한 번만 훑으면서 곱하고 더합니다.
+    """
     if len(pattern_1d) != len(filter_1d):
         raise ValueError("1차원 배열 길이가 일치하지 않습니다.")
     total = 0.0
@@ -83,26 +122,38 @@ def compute_mac_1d(pattern_1d: list, filter_1d: list) -> float:
 
 
 def judge_scores(score_a: float, score_b: float, label_a: str, label_b: str, tie_label: str = "UNDECIDED") -> str:
-    """허용오차(epsilon = 1e-9) 기준으로 두 점수를 비교해 최종 라벨을 판정합니다."""
+    """
+    [최종 승자 판정 기능]
+    두 정답지(A와 B, 또는 Cross와 X)의 점수를 비교해 더 높은 쪽을 정답으로 고릅니다.
+    단, 두 점수 차이가 허용오차(1e-9)보다 작으면 사실상 같은 점수로 보고 '무승부'로 판정합니다.
+    """
     if abs(score_a - score_b) < EPSILON:
         return tie_label
     return label_a if score_a > score_b else label_b
 
 
 def measure_mac_avg_ms(pattern: PatternMatrix, filter_matrix: PatternMatrix, repeats: int = REPEAT_COUNT) -> float:
-    """I/O 시간을 제외하고 순수 MAC 연산 함수 호출 시간만 반복 측정해 평균(ms)을 반환합니다."""
-    start = time.perf_counter()
+    """
+    [순수 계산 속도 측정기]
+    글자를 입력하거나 파일을 읽는 시간은 빼고, 오직 곱하고 더하는 계산(compute_mac)만
+    10번 반복 실행한 뒤 1번당 평균 몇 밀리초(ms)가 걸렸는지 계산합니다.
+    """
+    start = time.perf_counter()  # 초시계 시작
     for _ in range(repeats):
         compute_mac(pattern, filter_matrix)
-    elapsed_sec = time.perf_counter() - start
-    return (elapsed_sec / repeats) * 1000.0
+    elapsed_sec = time.perf_counter() - start  # 초시계 정지 후 총 걸린 시간 계산
+    return (elapsed_sec / repeats) * 1000.0    # 평균 시간(초)을 밀리초(ms) 단위로 변환
 
 
 def generate_synthetic_patterns(n: int) -> tuple:
-    """[보너스] 크기 N에 맞는 N×N 십자가(Cross)와 X 패턴을 자동 생성합니다."""
+    """
+    [보너스 기능: 연습용 바둑판 자동 생성기]
+    원하는 크기(n)를 알려주면 정가운데 가로·세로 줄이 1인 '십자가(Cross)' 바둑판과
+    양쪽 대각선 줄이 1인 'X' 바둑판을 자동으로 만들어 줍니다.
+    """
     cross = PatternMatrix(n)
     x_pat = PatternMatrix(n)
-    mid = n // 2
+    mid = n // 2  # 바둑판의 정가운데 줄 번호
     for r in range(n):
         for c in range(n):
             if r == mid or c == mid:
@@ -111,20 +162,23 @@ def generate_synthetic_patterns(n: int) -> tuple:
                 x_pat.set_value(r, c, 1.0)
     return cross, x_pat
 
-
 def read_3x3_matrix(title: str) -> PatternMatrix:
-    """콘솔에서 3×3 숫자 배열을 한 줄씩 입력받고 행/열 및 숫자 파싱을 검증합니다."""
+    """
+    [사용자 직접 입력 도우미 (모드 1용)]
+    키보드로 3×3 바둑판 숫자를 한 줄에 3개씩 총 3줄 입력받습니다.
+    숫자가 아닌 글자를 치거나 3칸을 안 맞추면 안내 문구를 보여주고 그 줄만 다시 입력받습니다.
+    """
     print(f"{title} (3줄 입력, 공백 구분)")
     rows = []
     row_idx = 0
     while row_idx < 3:
         raw_line = input().strip()
-        parts = raw_line.split()
+        parts = raw_line.split()  # 띄어쓰기를 기준으로 숫자를 나눕니다.
         if len(parts) != 3:
             print("입력 형식 오류: 각 줄에 3개의 숫자를 공백으로 구분해 입력하세요.")
             continue
         try:
-            nums = [float(x) for x in parts]
+            nums = [float(x) for x in parts]  # 글자를 실제 계산 가능한 숫자로 바꿉니다.
         except ValueError:
             print("입력 형식 오류: 각 줄에 3개의 숫자를 공백으로 구분해 입력하세요.")
             continue
@@ -134,7 +188,11 @@ def read_3x3_matrix(title: str) -> PatternMatrix:
 
 
 def print_performance_table(sizes: list, sample_pairs: dict, repeats: int = REPEAT_COUNT) -> None:
-    """크기별 평균 연산 시간(ms)과 연산 횟수(N²) 표를 출력합니다."""
+    """
+    [속도 비교 표 출력기]
+    바둑판 크기(3×3, 5×5, 13×13, 25×25)별로 평균 계산 시간(ms)과
+    총 계산 칸 수(N²)를 보기 좋은 표 형태로 화면에 출력합니다.
+    """
     print(f"\n#---------------------------------------")
     print(f"# [성능 분석] (평균/{repeats}회)")
     print(f"#---------------------------------------")
@@ -143,13 +201,16 @@ def print_performance_table(sizes: list, sample_pairs: dict, repeats: int = REPE
     for n in sizes:
         pat, flt = sample_pairs[n]
         avg_ms = measure_mac_avg_ms(pat, flt, repeats=repeats)
-        ops = n * n
+        ops = n * n  # 가로 N칸 × 세로 N칸 = 총 계산 칸 수(N²)
         size_label = f"{n}×{n}"
         print(f"{size_label:<10} {avg_ms:<16.4f} {ops:<10}")
 
 
 def run_user_input_mode() -> None:
-    """모드 1: 사용자 직접 입력 (3×3 필터 A, B 및 패턴 판정)"""
+    """
+    [메뉴 1번 실행 흐름: 내가 직접 3×3 바둑판 입력해서 판정하기]
+    정답지 A와 B를 입력받고, 문제 바둑판을 입력받아 점수와 승자를 보여줍니다.
+    """
     print("\n#---------------------------------------")
     print("# [1] 필터 입력")
     print("#---------------------------------------")
@@ -163,6 +224,7 @@ def run_user_input_mode() -> None:
     print("#---------------------------------------")
     pattern = read_3x3_matrix("패턴")
 
+    # A 점수와 B 점수를 각각 계산하고 승자를 가립니다.
     score_a = compute_mac(pattern, filter_a)
     score_b = compute_mac(pattern, filter_b)
     avg_ms = measure_mac_avg_ms(pattern, filter_a, repeats=REPEAT_COUNT)
@@ -172,6 +234,7 @@ def run_user_input_mode() -> None:
     print("# [3] MAC 결과")
     print("#---------------------------------------")
     if verdict == "판정 불가":
+        # 무승부일 때는 미세한 소수점 차이까지 확인할 수 있게 소수점 16자리까지 보여줍니다.
         print(f"A 점수: {score_a:.16f}")
         print(f"B 점수: {score_b:.16f}")
         print(f"연산 시간(평균/{REPEAT_COUNT}회): {avg_ms:.4f} ms")
@@ -186,7 +249,12 @@ def run_user_input_mode() -> None:
 
 
 def run_json_analysis_mode(json_path: str = "data.json") -> None:
-    """모드 2: data.json 로드, 스키마 검증, 라벨 정규화, 일괄 판정 및 성능 분석"""
+    """
+    [메뉴 2번 실행 흐름: 문제 파일(data.json) 한꺼번에 채점하기]
+    1) 파일에서 크기별 정답지(필터)를 읽어와 이름표를 'Cross', 'X'로 통일합니다.
+    2) 문제들을 하나씩 채점해 기대 정답과 비교(PASS/FAIL)합니다.
+    3) 크기별 속도 비교 표와 최종 성적표(총/통과/실패)를 출력합니다.
+    """
     path = Path(json_path)
     if not path.exists():
         print(f"\n[오류] '{json_path}' 파일을 찾을 수 없습니다. 같은 폴더에 파일을 배치해 주세요.")
@@ -204,6 +272,7 @@ def run_json_analysis_mode(json_path: str = "data.json") -> None:
         print("\n[오류] data.json 최상위 스키마('filters', 'patterns')가 올바르지 않습니다.")
         return
 
+    # [1단계] 크기별 정답지(필터) 불러오기
     print("\n#---------------------------------------")
     print("# [1] 필터 로드")
     print("#---------------------------------------")
@@ -217,7 +286,7 @@ def run_json_analysis_mode(json_path: str = "data.json") -> None:
         normalized_group = {}
         try:
             for raw_k, matrix_data in filter_group.items():
-                std_label = normalize_label(raw_k)
+                std_label = normalize_label(raw_k)  # 'cross' -> 'Cross', 'x' -> 'X' 통일
                 normalized_group[std_label] = PatternMatrix(n, matrix_data)
             if "Cross" not in normalized_group or "X" not in normalized_group:
                 raise ValueError("필수 필터(Cross, X)가 누락되었습니다.")
@@ -226,6 +295,7 @@ def run_json_analysis_mode(json_path: str = "data.json") -> None:
         except Exception as exc:
             print(f"✗ {size_key:<7} 필터 로드 실패: {exc}")
 
+    # [2단계] 문제 하나씩 채점하고 PASS/FAIL 판정하기
     print("\n#---------------------------------------")
     print("# [2] 패턴 분석 (라벨 정규화 적용)")
     print("#---------------------------------------")
@@ -241,6 +311,7 @@ def run_json_analysis_mode(json_path: str = "data.json") -> None:
             if not isinstance(case_info, dict):
                 raise ValueError("케이스 데이터 형식이 객체(dict)가 아닙니다.")
 
+            # 문제 이름('size_5_1')에서 숫자 '5'를 뽑아내어 5×5 정답지를 찾아냅니다.
             key_match = re.match(r"^size_(\d+)_(.+)$", case_key)
             if not key_match:
                 raise ValueError(f"패턴 키 규칙(size_{{N}}_{{idx}}) 위반: '{case_key}'")
@@ -254,6 +325,7 @@ def run_json_analysis_mode(json_path: str = "data.json") -> None:
             if not isinstance(raw_input, list):
                 raise ValueError("'input' 필드가 2차원 배열이 아닙니다.")
 
+            # 바둑판 크기 검증 및 정답 이름표('+' -> 'Cross') 통일
             pattern_matrix = PatternMatrix(n, raw_input)
             expected_label = normalize_label(raw_expected)
 
@@ -263,6 +335,7 @@ def run_json_analysis_mode(json_path: str = "data.json") -> None:
             if n not in perf_samples:
                 perf_samples[n] = (pattern_matrix, cross_filter)
 
+            # Cross 점수와 X 점수를 각각 계산하고 최종 판정을 내립니다.
             cross_score = compute_mac(pattern_matrix, cross_filter)
             x_score = compute_mac(pattern_matrix, x_filter)
             verdict = judge_scores(cross_score, x_score, "Cross", "X", tie_label="UNDECIDED")
@@ -270,6 +343,7 @@ def run_json_analysis_mode(json_path: str = "data.json") -> None:
             print(f"Cross 점수: {cross_score:.1f}" if cross_score.is_integer() else f"Cross 점수: {cross_score:.16f}")
             print(f"X 점수: {x_score:.1f}" if x_score.is_integer() else f"X 점수: {x_score:.16f}")
 
+            # 판정 결과가 기대 정답과 같으면 PASS, 다르면 FAIL로 기록합니다.
             if verdict == expected_label:
                 pass_count += 1
                 print(f"판정: {verdict} | expected: {expected_label} | PASS")
@@ -282,11 +356,12 @@ def run_json_analysis_mode(json_path: str = "data.json") -> None:
                 print(f"판정: {verdict} | expected: {expected_label} | FAIL ({reason})")
 
         except Exception as exc:
+            # 크기가 안 맞는 불량 문제가 들어와도 프로그램이 멈추지 않고 이 문제만 FAIL 처리합니다.
             reason = f"스키마/크기 검증 오류: {exc}"
             fail_cases.append((case_key, reason))
             print(f"판정: ERROR | FAIL ({reason})")
 
-    # 성능 분석 (3×3 포함, 5×5 / 13×13 / 25×25 출력)
+    # [3단계] 크기별 계산 속도 비교 표 출력 (3×3, 5×5, 13×13, 25×25)
     target_sizes = [3, 5, 13, 25]
     for sz in target_sizes:
         if sz not in perf_samples:
@@ -294,6 +369,7 @@ def run_json_analysis_mode(json_path: str = "data.json") -> None:
 
     print_performance_table(target_sizes, perf_samples, repeats=REPEAT_COUNT)
 
+    # [4단계] 최종 성적표 요약 출력
     print("\n#---------------------------------------")
     print("# [4] 결과 요약")
     print("#---------------------------------------")
@@ -310,7 +386,10 @@ def run_json_analysis_mode(json_path: str = "data.json") -> None:
 
 
 def run_bonus_optimization_mode() -> None:
-    """[보너스] 패턴 자동 생성기 및 2D vs 1D 메모리 접근 최적화 성능 비교"""
+    """
+    [메뉴 3번 보너스 기능: 바둑판 자동 생성 및 2차원 vs 1줄 방식 속도 비교]
+    원하는 크기의 바둑판을 자동으로 만든 뒤, 기존 방식과 한 줄로 편 방식의 속도를 비교합니다.
+    """
     print("\n#---------------------------------------")
     print("# [보너스] 패턴 생성기 & 1D 메모리 최적화 비교")
     print("#---------------------------------------")
@@ -341,6 +420,10 @@ def run_bonus_optimization_mode() -> None:
 
 
 def main() -> None:
+    """
+    [프로그램 메인 시작점]
+    사용자가 '0. 종료'를 누를 때까지 메뉴 화면을 계속 보여주며 선택한 기능을 실행합니다.
+    """
     while True:
         print("\n=== Mini NPU Simulator ===")
         print("[모드 선택]")
@@ -363,5 +446,6 @@ def main() -> None:
             print("올바른 메뉴 번호(0, 1, 2, 3)를 선택해 주세요.")
 
 
+# 이 파일을 직접 실행했을 때 main() 메뉴 화면을 띄우도록 시작해 주는 줄입니다.
 if __name__ == "__main__":
     main()
